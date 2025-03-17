@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  typesense:
+    image: typesense/typesense:28.0
+    container_name: typesense
+    restart: unless-stopped
+    ports:
+      - "8108:8108"
+    volumes:
+      - typesense-data:/data
+      - typesense-analytics:/analytics-data
+    environment:
+      - TYPESENSE_API_KEY=xyz
+      - TYPESENSE_DATA_DIR=/data
+      - TYPESENSE_ENABLE_CORS=true
+    command: [
+      "--data-dir", "/data",
+      "--api-key", "xyz",
+      "--enable-search-analytics=true",
+      "--analytics-dir", "/analytics-data",
+      "--analytics-flush-interval", "60"
+    ]
+    networks:
+      - my-network
+
+networks:
+  my-network:
+    driver: bridge
+
+volumes:
+  typesense-data:
+    driver: local
+  typesense-analytics:
+    driver: local
