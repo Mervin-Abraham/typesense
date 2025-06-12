@@ -382,6 +382,34 @@ struct field {
         return false;
     }
 
+    static void add_default_json_values(nlohmann::json& json);
+
+    static field field_from_json(nlohmann::json json) {
+        add_default_json_values(json);
+
+        return field(json[fields::name].get<std::string>(), json[fields::type].get<std::string>(),
+                     json[fields::facet].get<bool>(),
+                     json[fields::optional].get<bool>(),
+                     json[fields::index].get<bool>(),
+                     json[fields::locale].get<std::string>(),
+                     json[fields::sort].get<int>(),
+                     json[fields::infix].get<int>(),
+                     json[fields::nested].get<bool>(),
+                     json[fields::nested_array].get<int>(),
+                     json[fields::num_dim].get<size_t>(),
+                     json[fields::vec_dist].get<std::string>() == "ip" ? ip : cosine,
+                     json[fields::reference].get<std::string>(),
+                     json[fields::embed].get<nlohmann::json>(),
+                     json[fields::range_index].get<bool>(),
+                     json[fields::store].get<bool>(),
+                     json[fields::stem].get<bool>(),
+                     json[fields::stem_dictionary].get<std::string>(),
+                     json[fields::hnsw_params].get<nlohmann::json>(),
+                     json[fields::async_reference].get<bool>(),
+                     json[fields::token_separators].get<nlohmann::json>(),
+                     json[fields::symbols_to_index].get<nlohmann::json>());
+    }
+
     static Option<bool> fields_to_json_fields(const std::vector<field> & fields,
                                               const std::string & default_sorting_field,
                                               nlohmann::json& fields_json);
@@ -417,6 +445,8 @@ struct field {
                                     bool is_update, std::vector<field>& flattened_fields);
 
     static void compact_nested_fields(tsl::htrie_map<char, field>& nested_fields);
+
+    static nlohmann::json field_to_json_field(const struct field& field);
 };
 
 enum index_operation_t {

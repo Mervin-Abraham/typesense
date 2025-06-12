@@ -384,6 +384,7 @@ struct group_by_field_it_t {
     std::string field_name;
     posting_list_t::iterator_t it;
     bool is_array;
+    bool is_string;
 };
 
 struct Hasher32 {
@@ -406,6 +407,10 @@ struct pair_hash {
         return std::hash<T1>()(pair.first) ^ std::hash<T2>()(pair.second);
     }
 };
+
+#ifdef TEST_BUILD
+    extern bool testing_not_equals_bug;
+#endif
 
 class Index {
 private:
@@ -464,6 +469,7 @@ private:
 
     // this is used for wildcard queries
     id_list_t* seq_ids;
+    mutable std::shared_mutex seq_ids_mutex;
 
     std::vector<char> symbols_to_index;
 
@@ -518,6 +524,7 @@ private:
                           const std::vector<std::string>& query_tokens,
                           token_ordering token_order, std::set<std::string>& absorbed_tokens,
                           std::string& filter_by_clause,
+                          std::string& sort_by_clause,
                           bool enable_typos_for_numerical_tokens,
                           bool enable_typos_for_alpha_numerical_tokens) const;
 
@@ -603,7 +610,9 @@ private:
     static void handle_doc_ops(const tsl::htrie_map<char, field>& search_schema,
                                nlohmann::json& update_doc, const nlohmann::json& old_doc);
 
-    static void get_doc_changes(const index_operation_t op, const tsl::htrie_map<char, field>& embedding_fields,
+    static void get_doc_changes(const index_operation_t op,
+                                const tsl::htrie_map<char, field>& search_schema,
+                                const tsl::htrie_map<char, field>& embedding_fields,
                                 nlohmann::json &update_doc, const nlohmann::json &old_doc, nlohmann::json &new_doc,
                                 nlohmann::json &del_doc);
 
@@ -649,9 +658,10 @@ private:
     Option<int64_t> get_geo_distance(const std::string& geo_field_name, const uint32_t& seq_id,
                                      const S2LatLng& reference_lat_lng, const bool& round_distance = false) const;
 
-    Option<uint32_t> get_ref_seq_id_helper(const sort_by& sort_field, const uint32_t& seq_id, std::string& prev_coll_name,
-                                           std::map<std::string, reference_filter_result_t> const*& references,
-                                           std::string& ref_coll_name) const;
+    Option<std::vector<uint32_t>> get_ref_seq_ids_helper(const std::vector<uint32_t>& seq_ids_vec,
+                                                         std::string& prev_coll_name,
+                                                         std::map<std::string, reference_filter_result_t> const*& references,
+                                                         std::string& ref_coll_name) const;
 
 public:
     // for limiting number of results on multiple candidates / query rewrites
@@ -674,8 +684,6 @@ public:
     static const int DROP_TOKENS_THRESHOLD = 1;
 
     enum {DEFAULT_TOPSTER_SIZE = 250};
-
-    static const size_t GROUP_LIMIT_MAX = 99;
 
     /// Value used when async_reference is true and a reference doc is not found.
     static constexpr int64_t reference_helper_sentinel_value = UINT32_MAX;
@@ -896,7 +904,8 @@ public:
                                                  std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                                  const bool& validate_field_names) const;
 
-    int64_t reference_string_sort_score(const std::string& field_name, const uint32_t& seq_id) const;
+    int64_t reference_string_sort_score(const string &field_name,  const std::vector<uint32_t>& seq_ids_vec,
+                                        const bool& is_asc) const;
 
     static void remove_matched_tokens(std::vector<std::string>& tokens, const std::set<std::string>& rule_token_set) ;
 
@@ -1082,12 +1091,13 @@ public:
                                      const int* sort_order,
                                      int64_t& out_best_field_match_score);
 
-    void process_filter_overrides(const std::vector<const override_t*>& filter_overrides,
+    void process_filter_sort_overrides(const std::vector<const override_t*>& filter_overrides,
                                   std::vector<std::string>& query_tokens,
                                   token_ordering token_order,
                                   std::unique_ptr<filter_node_t>& filter_tree_root,
                                   std::vector<const override_t*>& matched_dynamic_overrides,
                                   nlohmann::json& override_metadata,
+                                  std::string& sort_by_clause,
                                   bool enable_typos_for_numerical_tokens,
                                   bool enable_typos_for_alpha_numerical_tokens,
                                   const bool& validate_field_names = true) const;
@@ -1097,7 +1107,7 @@ public:
                                      const std::vector<size_t>& geopoint_indices, uint32_t seq_id,
                                      const std::map<basic_string<char>, reference_filter_result_t>& references,
                                      std::vector<uint32_t>& filter_indexes, int64_t max_field_match_score,
-                                     int64_t* scores, int64_t& match_score_index, bool& should_skip,
+                                     int64_t* scores, int64_t& match_score_index,
                                      float vector_distance = 0) const;
 
     void process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>& included_ids,
@@ -1133,16 +1143,16 @@ public:
 
     void aggregate_facet(const size_t group_limit, facet& this_facet, facet& acc_facet) const;
 
-    Option<int64_t> get_geo_distance_with_lock(const std::string& geo_field_name, const uint32_t& seq_id,
+    Option<int64_t> get_geo_distance_with_lock(const std::string& geo_field_name, const bool& is_asc,
+                                               const std::vector<uint32_t>& seq_ids_vec,
                                                const S2LatLng& reference_lat_lng, const bool& round_distance = false) const;
 
-    Option<int64_t> get_referenced_geo_distance(const sort_by& sort_field, uint32_t seq_id,
+    Option<int64_t> get_referenced_geo_distance(const sort_by& sort_field, const bool& is_asc, const uint32_t& seq_id,
                                                 const std::map<basic_string<char>, reference_filter_result_t>& references,
                                                 const S2LatLng& reference_lat_lng, const bool& round_distance = false) const;
 
-    Option<uint32_t> get_ref_seq_id(const sort_by& sort_field, const uint32_t& seq_id,
-                                    const std::map<std::string, reference_filter_result_t>& references,
-                                    std::string& ref_collection_name) const;
+    Option<std::vector<uint32_t>> get_ref_seq_ids(const sort_by& sort_field, const uint32_t& seq_id,
+                                                  const std::map<std::string, reference_filter_result_t>& references) const;
 
     void get_top_k_result_ids(const std::vector<std::vector<KV*>>& raw_result_kvs, std::vector<uint32_t>& result_ids) const;
 

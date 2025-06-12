@@ -66,6 +66,9 @@ private:
     std::mutex mutex;
     std::map<uint64_t, req_res_t> req_res_map;
 
+    // used in tracking references
+    std::map<uint64_t, std::string> req_colls;
+
     std::atomic<int64_t> queued_writes = 0;
 
     /* ------------------------------------------------------- */
@@ -127,4 +130,6 @@ public:
     std::string get_collection_name(const std::shared_ptr<http_req>& req);
 
     std::shared_mutex& get_pause_mutex();
+
+    size_t get_reference_q_size();
 };

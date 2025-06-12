@@ -335,13 +335,10 @@ struct collection_search_args_t {
                              collection_search_args_t& args);
 };
 
-class Collection {
+class Collection: std::enable_shared_from_this<Collection> {
 private:
 
     mutable std::shared_mutex mutex;
-
-    // ensures that a Collection* is not destructed while in use by multiple threads
-    mutable std::shared_mutex lifecycle_mutex;
 
     static const uint8_t CURATED_RECORD_IDENTIFIER = 100;
 
@@ -600,13 +597,14 @@ private:
                                         std::vector<field>& update_fields,
                                         std::string& fallback_field_type);
 
-    void process_filter_overrides(std::vector<const override_t*>& filter_overrides,
+    void process_filter_sort_overrides(std::vector<const override_t*>& filter_overrides,
                                   std::vector<std::string>& q_include_tokens,
                                   token_ordering token_order,
                                   std::unique_ptr<filter_node_t>& filter_tree_root,
                                   std::vector<std::pair<uint32_t, uint32_t>>& included_ids,
                                   std::vector<uint32_t>& excluded_ids,
                                   nlohmann::json& override_metadata,
+                                  std::string& sort_by_clause,
                                   bool enable_typos_for_numerical_tokens=true,
                                   bool enable_typos_for_alpha_numerical_tokens=true,
                                   const bool& validate_field_names = true) const;
@@ -731,7 +729,7 @@ public:
                spp::sparse_hash_map<std::string, std::string> referenced_in = spp::sparse_hash_map<std::string, std::string>(),
                const nlohmann::json& metadata = {},
                spp::sparse_hash_map<std::string, std::set<reference_pair_t>> async_referenced_ins =
-                       spp::sparse_hash_map<std::string, std::set<reference_pair_t>>());
+                        spp::sparse_hash_map<std::string, std::set<reference_pair_t>>());
 
     ~Collection();
 
@@ -750,8 +748,6 @@ public:
     uint32_t get_collection_id() const;
 
     uint32_t get_next_seq_id();
-
-    Option<uint32_t> doc_id_to_seq_id_with_lock(const std::string & doc_id) const;
 
     Option<uint32_t> doc_id_to_seq_id(const std::string & doc_id) const;
 
@@ -1083,17 +1079,27 @@ public:
                                                  std::array<spp::sparse_hash_map<uint32_t, int64_t, Hasher32>*, 3>& field_values,
                                                  const bool& validate_field_names = true) const;
 
-    int64_t reference_string_sort_score(const std::string& field_name, const uint32_t& seq_id) const;
+    int64_t reference_string_sort_score(const string &field_name,  const std::vector<uint32_t>& seq_ids,
+                                        const bool& is_asc) const;
 
     bool is_referenced_in(const std::string& collection_name) const;
 
-    void add_referenced_ins(const std::set<reference_info_t>& ref_infos);
+    // Return a copy of the referenced field in the referencing collection to avoid schema lookups in the future. The
+    // tradeoff is that we have to make sure any changes during collection alter operation are passed to the referencing
+    // collection.
+    [[nodiscard]] std::set<update_reference_info_t> add_referenced_ins(std::map<std::string, reference_info_t>& ref_infos);
 
-    void add_referenced_in(const std::string& collection_name, const std::string& field_name,
-                                   const bool& is_async, const std::string& referenced_field_name);
+    [[nodiscard]] std::set<update_reference_info_t> add_referenced_in(const std::string& collection_name,
+                                                                      const std::string& field_name, const bool& is_async,
+                                                                      const std::string& referenced_field_name,
+                                                                      field& referenced_field);
 
     void remove_referenced_in(const std::string& collection_name, const std::string& field_name,
                               const bool& is_async, const std::string& referenced_field_name);
+
+    void update_reference_field_with_lock(const std::string& field_name, const field& ref_field);
+
+    void update_reference_field(const std::string& field_name, const field& ref_field);
 
     Option<std::string> get_referenced_in_field_with_lock(const std::string& collection_name) const;
 
@@ -1110,8 +1116,6 @@ public:
 
     friend class filter_result_iterator_t;
 
-    std::shared_mutex& get_lifecycle_mutex();
-
     static void expand_search_query(const tsl::htrie_map<char, field>& search_schema, const std::vector<char>& symbols_to_index,const std::vector<char>& token_separators,
                                     const std::string& raw_query, size_t offset, size_t total, const search_args* search_params,
                                     const std::vector<std::vector<KV*>>& result_group_kvs,
@@ -1124,11 +1128,12 @@ public:
     Option<bool> get_related_ids(const std::string& ref_field_name, const uint32_t& seq_id,
                                  std::vector<uint32_t>& result) const;
 
-    Option<int64_t> get_referenced_geo_distance_with_lock(const sort_by& sort_field, const uint32_t& seq_id,
+    Option<int64_t> get_referenced_geo_distance_with_lock(const sort_by& sort_field, const bool& is_asc, const uint32_t& seq_id,
                                                           const std::map<basic_string<char>, reference_filter_result_t>& references,
                                                           const S2LatLng& reference_lat_lng, const bool& round_distance) const;
 
-    Option<int64_t> get_geo_distance_with_lock(const std::string& geo_field_name, const uint32_t& seq_id,
+    Option<int64_t> get_geo_distance_with_lock(const std::string& geo_field_name, const bool& is_asc,
+                                               const std::vector<uint32_t>& seq_ids_vec,
                                                const S2LatLng& reference_lat_lng, const bool& round_distance = false) const;
 
     Option<nlohmann::json> get_alter_schema_status() const;

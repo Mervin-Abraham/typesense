@@ -2,7 +2,6 @@
 #include "text_embedder_remote.h"
 #include "embedder_manager.h"
 
-
 Option<bool> RemoteEmbedder::validate_string_properties(const nlohmann::json& model_config, const std::vector<std::string>& properties) {
     for(auto& property : properties) {
         if(model_config.count(property) == 0 || !model_config[property].is_string()) {
@@ -149,14 +148,23 @@ Option<bool> OpenAIEmbedder::is_model_valid(const nlohmann::json& model_config, 
     return Option<bool>(true);
 }
 
-embedding_res_t OpenAIEmbedder::Embed(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
+embedding_res_t OpenAIEmbedder::embed_query(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
     std::shared_lock<std::shared_mutex> lock(mutex);
-    return Embed(get_openai_create_embedding_url(openai_url,openai_create_embedding_suffix), text, remote_embedder_timeout_ms, remote_embedding_num_tries, api_key, num_dims, has_custom_dims, openai_model_path.substr(7), OpenAIEmbedderType::OPENAI);
+    return embed_query(get_openai_create_embedding_url(openai_url,openai_create_embedding_suffix), text, remote_embedder_timeout_ms, remote_embedding_num_tries, api_key, num_dims, has_custom_dims, openai_model_path.substr(7), OpenAIEmbedderType::OPENAI);
 }
 
-embedding_res_t OpenAIEmbedder::Embed(const std::string url, const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries, 
+embedding_res_t OpenAIEmbedder::embed_query(const std::string url, const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries, 
                                       const std::string& api_key, const size_t num_dims, const bool has_custom_dims, 
                                       const std::string& model_name, const OpenAIEmbedderType embedder_type) {
+    std::string cache_key = text + model_name;
+    {
+        std::shared_lock<std::shared_mutex> cache_read_lock(RemoteEmbedder::cache_mutex);
+        auto key_it = RemoteEmbedder::cache.find(cache_key);
+        if(key_it != RemoteEmbedder::cache.end()) {
+            return key_it->second;
+        }
+    }
+
     std::unordered_map<std::string, std::string> headers;
     std::map<std::string, std::string> res_headers;
     headers["Content-Type"] = "application/json";
@@ -182,31 +190,35 @@ embedding_res_t OpenAIEmbedder::Embed(const std::string url, const std::string& 
     }
     try {
         embedding_res_t embedding_res = embedding_res_t(nlohmann::json::parse(res)["data"][0]["embedding"].get<std::vector<float>>());
+        {
+            std::unique_lock<std::shared_mutex> cache_write_lock(RemoteEmbedder::cache_mutex);
+            RemoteEmbedder::cache.insert(cache_key, embedding_res);
+        }
         return embedding_res;
     } catch (const std::exception& e) {
         return embedding_res_t(500, get_error_json(req_body, res_code, res, url));
-    }                  
+    }
 }
 
-std::vector<embedding_res_t> OpenAIEmbedder::batch_embed(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
+std::vector<embedding_res_t> OpenAIEmbedder::embed_documents(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
                                                          const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries) {
     // call recursively if inputs larger than remote_embedding_batch_size
     if(inputs.size() > remote_embedding_batch_size) {
         std::vector<embedding_res_t> outputs;
         for(size_t i = 0; i < inputs.size(); i += remote_embedding_batch_size) {
             auto batch = std::vector<std::string>(inputs.begin() + i, inputs.begin() + std::min(i + remote_embedding_batch_size, inputs.size()));
-            auto batch_outputs = batch_embed(batch, remote_embedding_batch_size, remote_embedding_timeout_ms, remote_embedding_num_tries);
+            auto batch_outputs = embed_documents(batch, remote_embedding_batch_size, remote_embedding_timeout_ms, remote_embedding_num_tries);
             outputs.insert(outputs.end(), batch_outputs.begin(), batch_outputs.end());
         }
         return outputs;
     }
 
-    return batch_embed(get_openai_create_embedding_url(openai_url, openai_create_embedding_suffix), inputs, remote_embedding_timeout_ms, 
+    return embed_documents(get_openai_create_embedding_url(openai_url, openai_create_embedding_suffix), inputs, remote_embedding_timeout_ms, 
                        remote_embedding_num_tries, api_key, num_dims, has_custom_dims, openai_model_path.substr(7), 
                        OpenAIEmbedderType::OPENAI);
 }
 
-std::vector<embedding_res_t> OpenAIEmbedder::batch_embed(const std::string url, const std::vector<std::string>& inputs, const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries, 
+std::vector<embedding_res_t> OpenAIEmbedder::embed_documents(const std::string url, const std::vector<std::string>& inputs, const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries, 
                                                          const std::string& api_key, const size_t num_dims, const bool has_custom_dims, const std::string& model_name,
                                                          const OpenAIEmbedderType embedder_type) {
     nlohmann::json req_body;
@@ -221,7 +233,7 @@ std::vector<embedding_res_t> OpenAIEmbedder::batch_embed(const std::string url, 
     } else if(embedder_type == OpenAIEmbedderType::AZURE_OPENAI) {
         headers["api-key"] = api_key;
     }
-    
+
     headers["Content-Type"] = "application/json";
     headers["timeout_ms"] = std::to_string(remote_embedding_timeout_ms);
     headers["num_try"] = std::to_string(remote_embedding_num_tries);
@@ -369,8 +381,16 @@ Option<bool> GoogleEmbedder::is_model_valid(const nlohmann::json& model_config, 
     return Option<bool>(true);
 }
 
-embedding_res_t GoogleEmbedder::Embed(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
+embedding_res_t GoogleEmbedder::embed_query(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
     std::shared_lock<std::shared_mutex> lock(mutex);
+    std::string cache_key = text + SUPPORTED_MODEL;
+    {
+        std::shared_lock<std::shared_mutex> cache_read_lock(RemoteEmbedder::cache_mutex);
+        auto key_it = RemoteEmbedder::cache.find(cache_key);
+        if(key_it != RemoteEmbedder::cache.end()) {
+            return key_it->second;
+        }
+    }
 
     std::unordered_map<std::string, std::string> headers;
     std::map<std::string, std::string> res_headers;
@@ -388,25 +408,30 @@ embedding_res_t GoogleEmbedder::Embed(const std::string& text, const size_t remo
     }
 
     try {
-        return embedding_res_t(nlohmann::json::parse(res)["embedding"]["value"].get<std::vector<float>>());
+        auto res_obj = embedding_res_t(nlohmann::json::parse(res)["embedding"]["value"].get<std::vector<float>>());
+        {
+            std::unique_lock<std::shared_mutex> cache_write_lock(RemoteEmbedder::cache_mutex);
+            RemoteEmbedder::cache.insert(cache_key, res_obj);
+        }
+        return res_obj;
     } catch (const std::exception& e) {
         return embedding_res_t(500, get_error_json(req_body, res_code, res));
     }
 }
 
 
-std::vector<embedding_res_t> GoogleEmbedder::batch_embed(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
+std::vector<embedding_res_t> GoogleEmbedder::embed_documents(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
                                                          const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries) {
     std::vector<embedding_res_t> outputs;
     bool timeout_prev = false;
     for(auto& input : inputs) {
-        auto res = Embed(input, remote_embedding_timeout_ms, remote_embedding_num_tries);
+        auto res = embed_query(input, remote_embedding_timeout_ms, remote_embedding_num_tries);
         if(res.status_code == 408) {
             if(timeout_prev) {
                 // fail whole batch if two consecutive timeouts,
                 nlohmann::json req_body;
                 req_body["text"] = input;
-               return std::vector<embedding_res_t>(inputs.size(), embedding_res_t(408, get_error_json(req_body, 408, "")));
+                return std::vector<embedding_res_t>(inputs.size(), embedding_res_t(408, get_error_json(req_body, 408, "")));
             }
             timeout_prev = true;
         }
@@ -447,8 +472,10 @@ std::string GoogleEmbedder::get_model_key(const nlohmann::json& model_config) {
 
 
 GCPEmbedder::GCPEmbedder(const std::string& project_id, const std::string& model_name, const std::string& access_token, 
-                         const std::string& refresh_token, const std::string& client_id, const std::string& client_secret, const bool has_custom_dims, const size_t num_dims) :
-        project_id(project_id), access_token(access_token), refresh_token(refresh_token), client_id(client_id), client_secret(client_secret), has_custom_dims(has_custom_dims), num_dims(num_dims) {
+                         const std::string& refresh_token, const std::string& client_id, const std::string& client_secret, const bool has_custom_dims, const size_t num_dims,
+                         const std::string& document_task, const std::string& query_task) :
+        project_id(project_id), access_token(access_token), refresh_token(refresh_token), client_id(client_id), client_secret(client_secret), has_custom_dims(has_custom_dims), num_dims(num_dims),
+        document_task(document_task), query_task(query_task) {
     
     this->model_name = EmbedderManager::get_model_name_without_namespace(model_name);
 }
@@ -458,6 +485,14 @@ Option<bool> GCPEmbedder::is_model_valid(const nlohmann::json& model_config, siz
 
     if (!validate_properties.ok()) {
         return validate_properties;
+    }
+
+    if(model_config.count("document_task") > 0 && !model_config["document_task"].is_string()) {
+        return Option<bool>(400, "Property `embed.model_config.document_task` is not a string.");
+    }
+
+    if(model_config.count("query_task") > 0 && !model_config["query_task"].is_string()) {
+        return Option<bool>(400, "Property `embed.model_config.query_task` is not a string.");
     }
     
     auto model_name = model_config["model_name"].get<std::string>();
@@ -541,12 +576,24 @@ Option<bool> GCPEmbedder::is_model_valid(const nlohmann::json& model_config, siz
     return Option<bool>(true);
 }
 
-embedding_res_t GCPEmbedder::Embed(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
+embedding_res_t GCPEmbedder::embed_query(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
     std::shared_lock<std::shared_mutex> lock(mutex);
+
+    std::string cache_key = text + model_name;
+    {
+        std::shared_lock<std::shared_mutex> cache_read_lock(RemoteEmbedder::cache_mutex);
+        auto key_it = RemoteEmbedder::cache.find(cache_key);
+        if(key_it != RemoteEmbedder::cache.end()) {
+            return key_it->second;
+        }
+    }
 
     nlohmann::json req_body;
     req_body["instances"] = nlohmann::json::array();
     nlohmann::json instance;
+    if(!query_task.empty()) {
+        instance["task_type"] = query_task;
+    }
     instance["content"] = text;
     req_body["instances"].push_back(instance);
     if(has_custom_dims) {
@@ -589,17 +636,24 @@ embedding_res_t GCPEmbedder::Embed(const std::string& text, const size_t remote_
     } catch (const std::exception& e) {
         return embedding_res_t(500, get_error_json(req_body, res_code, res));
     }
-    return embedding_res_t(res_json["predictions"][0]["embeddings"]["values"].get<std::vector<float>>());
+    auto res_obj = embedding_res_t(res_json["predictions"][0]["embeddings"]["values"].get<std::vector<float>>());
+
+    {
+        std::unique_lock<std::shared_mutex> cache_write_lock(RemoteEmbedder::cache_mutex);
+        RemoteEmbedder::cache.insert(cache_key, res_obj);
+    }
+
+    return res_obj;
 }
 
 
-std::vector<embedding_res_t> GCPEmbedder::batch_embed(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
+std::vector<embedding_res_t> GCPEmbedder::embed_documents(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
                                                       const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries) {
     // GCP API has a limit of 5 instances per request
     if(inputs.size() > 5) {
         std::vector<embedding_res_t> res;
         for(size_t i = 0; i < inputs.size(); i += 5) {
-            auto batch_res = batch_embed(std::vector<std::string>(inputs.begin() + i, inputs.begin() + std::min(i + 5, inputs.size())));
+            auto batch_res = embed_documents(std::vector<std::string>(inputs.begin() + i, inputs.begin() + std::min(i + 5, inputs.size())));
             res.insert(res.end(), batch_res.begin(), batch_res.end());
         }
         return res;
@@ -609,6 +663,9 @@ std::vector<embedding_res_t> GCPEmbedder::batch_embed(const std::vector<std::str
     for(const auto& input : inputs) {
         nlohmann::json instance;
         instance["content"] = input;
+        if(!document_task.empty()) {
+            instance["task_type"] = document_task;
+        }
         req_body["instances"].push_back(instance);
     }
     if(has_custom_dims) {
@@ -815,26 +872,26 @@ Option<bool> AzureEmbedder::is_model_valid(const nlohmann::json& model_config, s
     return Option<bool>(true);
 }
 
-embedding_res_t AzureEmbedder::Embed(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
+embedding_res_t AzureEmbedder::embed_query(const std::string& text, const size_t remote_embedder_timeout_ms, const size_t remote_embedding_num_tries) {
     std::shared_lock<std::shared_mutex> lock(mutex);
 
-    return OpenAIEmbedder::Embed(azure_url, text, remote_embedder_timeout_ms, remote_embedding_num_tries, api_key, num_dims, has_custom_dims, "", OpenAIEmbedder::OpenAIEmbedderType::AZURE_OPENAI);
+    return OpenAIEmbedder::embed_query(azure_url, text, remote_embedder_timeout_ms, remote_embedding_num_tries, api_key, num_dims, has_custom_dims, "", OpenAIEmbedder::OpenAIEmbedderType::AZURE_OPENAI);
 }
 
-std::vector<embedding_res_t> AzureEmbedder::batch_embed(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
+std::vector<embedding_res_t> AzureEmbedder::embed_documents(const std::vector<std::string>& inputs, const size_t remote_embedding_batch_size,
                                                          const size_t remote_embedding_timeout_ms, const size_t remote_embedding_num_tries) {
     // call recursively if inputs larger than remote_embedding_batch_size
     if(inputs.size() > remote_embedding_batch_size) {
         std::vector<embedding_res_t> outputs;
         for(size_t i = 0; i < inputs.size(); i += remote_embedding_batch_size) {
             auto batch = std::vector<std::string>(inputs.begin() + i, inputs.begin() + std::min(i + remote_embedding_batch_size, inputs.size()));
-            auto batch_outputs = batch_embed(batch, remote_embedding_batch_size, remote_embedding_timeout_ms, remote_embedding_num_tries);
+            auto batch_outputs = embed_documents(batch, remote_embedding_batch_size, remote_embedding_timeout_ms, remote_embedding_num_tries);
             outputs.insert(outputs.end(), batch_outputs.begin(), batch_outputs.end());
         }
         return outputs;
     }
     
-    return OpenAIEmbedder::batch_embed(azure_url, inputs, remote_embedding_timeout_ms, remote_embedding_num_tries, api_key, num_dims, has_custom_dims, "", OpenAIEmbedder::OpenAIEmbedderType::AZURE_OPENAI);
+    return OpenAIEmbedder::embed_documents(azure_url, inputs, remote_embedding_timeout_ms, remote_embedding_num_tries, api_key, num_dims, has_custom_dims, "", OpenAIEmbedder::OpenAIEmbedderType::AZURE_OPENAI);
 }
 
 nlohmann::json AzureEmbedder::get_error_json(const nlohmann::json& req_body, long res_code, const std::string& res_body) {

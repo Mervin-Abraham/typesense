@@ -21,6 +21,9 @@
 #include "conversation_model_manager.h"
 #include "conversation_model.h"
 #include "personalization_model_manager.h"
+#include "sole.hpp"
+#include "natural_language_search_model_manager.h"
+#include "natural_language_search_model.h"
 
 using namespace std::chrono_literals;
 
@@ -262,7 +265,6 @@ bool get_collections(const std::shared_ptr<http_req>& req, const std::shared_ptr
 
 bool post_create_collection(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     nlohmann::json req_json;
-
     try {
         req_json = nlohmann::json::parse(req->body);
     } catch(const std::exception& e) {
@@ -328,7 +330,7 @@ bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::sh
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -356,6 +358,8 @@ bool patch_update_collection(const std::shared_ptr<http_req>& req, const std::sh
         }
         // without this line, response will return full api key without being masked
         req_json["fields"] = alter_payload["fields"];
+
+        NaturalLanguageSearchModelManager::clear_schema_prompt(req->params["collection"]);
     }
 
     res->set_200(req_json.dump());
@@ -368,6 +372,10 @@ bool del_drop_collection(const std::shared_ptr<http_req>& req, const std::shared
     if(req->params.count("compact_store") != 0) {
         compact_store = (req->params["compact_store"] == "true");
     }
+
+    // Clear schema prompt cache for this collection before dropping it
+    NaturalLanguageSearchModelManager::clear_schema_prompt(req->params["collection"]);
+    LOG(INFO) << "Invalidated schema prompt cache for collection: " << req->params["collection"];
 
     CollectionManager & collectionManager = CollectionManager::get_instance();
     Option<nlohmann::json> drop_op = collectionManager.drop_collection(req->params["collection"], true, compact_store);
@@ -422,6 +430,14 @@ bool get_health_with_resource_usage(const std::shared_ptr<http_req>& req, const 
         if(!cpu_stats.empty() && StringUtils::is_float(cpu_stats[0].active)) {
             alive = alive && (std::stof(cpu_stats[0].active) < cpu_threshold);
         }
+    }
+
+    if(req->params.count("pending_write_batches_threshold") != 0 &&
+        StringUtils::is_uint32_t(req->params["pending_write_batches_threshold"])) {
+        const int64_t pending_write_batches_threshold = std::stol(req->params["pending_write_batches_threshold"]);
+        int64_t pending_write_batches = server->get_num_queued_writes();
+        bool is_lagging = (pending_write_batches > pending_write_batches_threshold);
+        alive = alive && !is_lagging;
     }
 
     result["ok"] = alive;
@@ -505,7 +521,8 @@ uint64_t hash_request(const std::shared_ptr<http_req>& req) {
     ss << req->route_hash << req->body;
 
     for(auto& kv: req->params) {
-        if(kv.first != "use_cache") {
+        const auto& param_name = kv.first;
+        if(param_name != "use_cache" && param_name != http_req::USER_HEADER) {
             ss << kv.second;
         }
     }
@@ -540,6 +557,10 @@ bool get_search(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
 
             if(seconds_elapsed < cached_value.ttl) {
                 res->set_content(cached_value.status_code, cached_value.content_type_header, cached_value.body, true);
+                AppMetrics::get_instance().increment_count(AppMetrics::CACHE_HIT_LABEL, 1);
+                AppMetrics::get_instance().increment_count(AppMetrics::SEARCH_LABEL, 1);
+                AppMetrics::get_instance().increment_duration(AppMetrics::SEARCH_LABEL, 1);
+                stream_response(req, res);
                 return true;
             }
 
@@ -550,25 +571,237 @@ bool get_search(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
 
     if(req->embedded_params_vec.empty()) {
         res->set_500("Embedded params is empty.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
+
+    bool conversation = false;
+    std::string conversation_id = "";
+    std::string conversation_model_id = "";
+    bool conversation_stream = false;
+    std::string query = req->params["q"];
+    std::string raw_query = query;
+
+    if(req->params.find("conversation") != req->params.end() && req->params["conversation"] == "true") {
+        conversation = true;
+    }
+
+    if(req->params.find("conversation_stream") != req->params.end() && req->params["conversation_stream"] == "true") {
+        conversation_stream = true;
+    }
+
+    if(req->params.find("conversation_id") != req->params.end()) {
+        conversation_id = req->params["conversation_id"];
+    }
+
+    if(req->params.find("conversation_model_id") != req->params.end()) {
+        conversation_model_id = req->params["conversation_model_id"];
+    }
+
+    if(conversation) {
+        if(conversation_model_id.empty()) {
+            res->set(400, "Conversation is enabled but no conversation model ID is provided.");
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+
+        auto conversation_model_op = ConversationModelManager::get_model(conversation_model_id);
+
+        if(!conversation_model_op.ok()) {
+            res->set(400, conversation_model_op.error());
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+    }
+
+
+    if(!conversation_id.empty()) {
+        auto conversation_model_op = ConversationModelManager::get_model(conversation_model_id);
+        if(!conversation) {
+            res->set_400("Conversation ID provided but conversation is not enabled for this collection.");
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+
+        auto conversation_history_op = ConversationManager::get_instance().get_conversation(conversation_id, conversation_model_op.get());
+        if(!conversation_history_op.ok()) {
+            res->set_400(conversation_history_op.error());
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+
+        auto conversation_history = conversation_history_op.get();
+
+        auto standalone_question_op = ConversationModel::get_standalone_question(conversation_history, raw_query, conversation_model_op.get());
+        if(!standalone_question_op.ok()) {
+            res->set_400(standalone_question_op.error());
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        query = standalone_question_op.get();
+        req->params["q"] = query;
+    }
+
+    uint64_t prompt_cache_ttl = NaturalLanguageSearchModelManager::DEFAULT_SCHEMA_PROMPT_TTL_SEC;
+    if(req->params.count("nl_query_prompt_cache_ttl") && StringUtils::is_uint64_t(req->params["nl_query_prompt_cache_ttl"])) {
+        prompt_cache_ttl = std::stoull(req->params["nl_query_prompt_cache_ttl"]);
+    }
+
+    auto nl_search_op = NaturalLanguageSearchModelManager::process_nl_query_and_augment_params(req->params, prompt_cache_ttl);
+    uint64_t nl_search_time_ms = nl_search_op.ok() ? nl_search_op.get() : 0;
 
     std::string results_json_str;
     Option<bool> search_op = CollectionManager::do_search(req->params, req->embedded_params_vec[0],
                                                           results_json_str, req->conn_ts);
+    if(conversation) {
+        nlohmann::json results_json = nlohmann::json::parse(results_json_str);
+        results_json["conversation"] = nlohmann::json::object();
+        results_json["conversation"]["query"] = query;
+
+        nlohmann::json docs_array = nlohmann::json::array();
+
+        if(results_json.count("hits") != 0 && results_json["hits"].is_array()) {
+            docs_array = results_json["hits"];
+        }
+
+        auto conversation_model = ConversationModelManager::get_model(conversation_model_id).get();
+        auto min_required_bytes_op = ConversationModel::get_minimum_required_bytes(conversation_model);
+        if(!min_required_bytes_op.ok()) {
+            res->status_code = min_required_bytes_op.code();
+            res->body = min_required_bytes_op.error();
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        auto min_required_bytes = min_required_bytes_op.get();
+        if(conversation_model["max_bytes"].get<size_t>() < min_required_bytes + query.size()) {
+            res->set_400("`max_bytes` of the conversation model is less than the minimum required bytes(" + std::to_string(min_required_bytes) + ").");
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        // remove document with lowest score until total tokens is less than MAX_TOKENS
+        while(docs_array.dump(0).size() > conversation_model["max_bytes"].get<size_t>() - min_required_bytes - query.size()) {
+            try {
+                if(docs_array.empty()) {
+                    break;
+                }
+                docs_array.erase(docs_array.size() - 1);
+            } catch(...) {
+                //return Option<nlohmann::json>(400, "Failed to remove document from search results.");
+                res->set_400("Failed to remove document from search results.");
+                res->final = true;
+                stream_response(req, res);
+                return false;
+            }
+        }
+
+        Option<std::string> qa_op("");
+        bool conversation_id_created_in_advance = false;
+
+        if(!conversation_stream) {
+            qa_op = ConversationModel::get_answer(docs_array.dump(0), query, conversation_model);
+        } else {
+            // create a new conversation_id in advance for streaming
+            if(conversation_id.empty()) {
+                conversation_id = sole::uuid4().str();
+                conversation_id_created_in_advance = true;
+            }
+            qa_op = ConversationModel::get_answer_stream(docs_array.dump(0), query, conversation_model, req, res, conversation_id);
+        }
+        if(!qa_op.ok()) {
+            res->status_code = qa_op.code();
+            res->body = qa_op.error();
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        results_json["conversation"]["answer"] = qa_op.get();
+        std::vector<std::string> exclude_fields;
+        StringUtils::split(req->params["exclude_fields"], exclude_fields, ",");
+        bool exclude_conversation_history = std::find(exclude_fields.begin(), exclude_fields.end(), "conversation_history") != exclude_fields.end();
+        if(exclude_conversation_history) {
+            results_json["conversation"]["conversation_id"] = conversation_id;
+        }
+
+        // do not send conversation id as param if streaming, because it is just created in advance for streaming
+        auto conversation_history_op = ConversationManager::get_instance().get_full_conversation(raw_query, qa_op.get(), conversation_model, conversation_id_created_in_advance ? "" : conversation_id);
+        if(!conversation_history_op.ok()) {
+            res->status_code = conversation_history_op.code();
+            res->body = conversation_history_op.error();
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        auto conversation_history = conversation_history_op.get();
+
+        auto new_conversation_op = ConversationManager::get_last_n_messages(conversation_history["conversation"], 2);
+        if(!new_conversation_op.ok()) {
+            res->status_code = new_conversation_op.code();
+            res->body = new_conversation_op.error();
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        auto new_conversation = new_conversation_op.get();
+
+        auto add_conversation_op = ConversationManager::get_instance().add_conversation(new_conversation, conversation_model, conversation_id, !conversation_id_created_in_advance);
+        if(!add_conversation_op.ok()) {
+            res->status_code = add_conversation_op.code();
+            res->body = add_conversation_op.error();
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+
+
+        if(!exclude_conversation_history) {
+            results_json["conversation"]["conversation_history"] = conversation_history;
+        }
+        results_json["conversation"]["conversation_id"] = add_conversation_op.get();
+
+        results_json["request_params"]["q"] = raw_query;
+        results_json["request_params"]["first_q"] = raw_query;
+
+        results_json_str = results_json.dump();
+
+    }
 
     if(!search_op.ok()) {
-        res->set(search_op.code(), search_op.error());
+        nlohmann::json error_json;
+        NaturalLanguageSearchModelManager::add_nl_query_data_to_results(error_json, &(req->params), nl_search_time_ms, true);
+        error_json["message"] = search_op.error();
+        res->set_body(search_op.code(), error_json.dump());
         if(search_op.code() == 408) {
             req->overloaded = true;
         }
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
+    nlohmann::json results_json = nlohmann::json::parse(results_json_str);
+    NaturalLanguageSearchModelManager::add_nl_query_data_to_results(results_json, &(req->params), nl_search_time_ms);
+    results_json_str = results_json.dump();
+
+    // if the response is an event stream, we need to add the data: prefix
+    if(conversation_stream) {
+        results_json_str = "data: " + results_json_str + "\n\n";
+    }
+
+
     res->set_200(results_json_str);
+    res->final = true;
+    stream_response(req, res);
 
     // we will cache only successful requests
-    if(use_cache) {
+    if(use_cache && !conversation_stream) {
         //LOG(INFO) << "Adding to cache, key = " << req_hash;
         auto now = std::chrono::high_resolution_clock::now();
         const auto cache_ttl_it = req->params.find("cache_ttl");
@@ -578,10 +811,11 @@ bool get_search(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
         }
 
         cached_res_t cached_res;
-        cached_res.load(res->status_code, res->content_type_header, res->body, now, cache_ttl, req_hash);
+        cached_res.load(res->status_code, res->content_type_header, results_json_str, now, cache_ttl, req_hash);
 
         std::unique_lock lock(mutex);
         res_cache.insert(req_hash, cached_res);
+        AppMetrics::get_instance().increment_count(AppMetrics::CACHE_MISS_LABEL, 1);
     }
 
     return true;
@@ -613,6 +847,10 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
             if(seconds_elapsed < cached_value.ttl) {
                 res->set_content(cached_value.status_code, cached_value.content_type_header, cached_value.body, true);
+                stream_response(req, res);
+                AppMetrics::get_instance().increment_count(AppMetrics::CACHE_HIT_LABEL, 1);
+                AppMetrics::get_instance().increment_count(AppMetrics::SEARCH_LABEL, 1);
+                AppMetrics::get_instance().increment_duration(AppMetrics::SEARCH_LABEL, 1);
                 return true;
             }
 
@@ -632,22 +870,30 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         } catch(const std::exception& e) {
             LOG(ERROR) << "JSON error: " << e.what();
             res->set_400("Bad JSON.");
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
     }
 
     if(req_json.count("searches") == 0) {
         res->set_400("Missing `searches` array.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
     if(!req_json["searches"].is_array()) {
         res->set_400("Missing `searches` array.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
     if(req->embedded_params_vec.empty()) {
         res->set_400("Missing embedded params array.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
@@ -667,6 +913,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
     if(req_json["searches"].size() > limit_multi_searches) {
         res->set_400(std::string("Number of multi searches exceeds `") + LIMIT_MULTI_SEARCHES + "` parameter.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
@@ -679,6 +927,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
                    << searches.size() << ", embedded_params_vec.size: " << req->embedded_params_vec.size()
                    << ", req_body: " << req->body;
         res->set_500("Embedded params parsing error.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
@@ -687,6 +937,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         auto api_key_ip_op = get_api_key_and_ip(req->metadata);
         if(!api_key_ip_op.ok()) {
             res->set(api_key_ip_op.code(), api_key_ip_op.error());
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
         const auto& api_key_ip = api_key_ip_op.get();
@@ -696,6 +948,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         for(size_t i = 0; i < searches.size(); i++) {
             if(RateLimitManager::getInstance()->is_rate_limited({RateLimitedEntityType::api_key, api_key_ip.first}, {RateLimitedEntityType::ip, api_key_ip.second})) {
                 res->set(429, "Rate limit exceeded or blocked");
+                res->final = true;
+                stream_response(req, res);
                 return false;
             }
         }
@@ -709,22 +963,29 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
     }
 
     bool conversation = orig_req_params["conversation"] == "true" && !is_union;
+    bool conversation_stream = orig_req_params["conversation_stream"] == "true" && !is_union;
     bool conversation_history = orig_req_params.find("conversation_id") != orig_req_params.end();
     std::string common_query;
 
     if(!conversation && conversation_history) {
         res->set_400("`conversation_id` can only be used if `conversation` is enabled.");
+        res->final = true;
+        stream_response(req, res);
         return false;
     }
 
     if(conversation) {
         if(orig_req_params.find("q") == orig_req_params.end()) {
             res->set_400("`q` parameter has to be common for all searches if conversation is enabled. Please set `q` as a query parameter in the request, instead of inside the POST body");
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
 
         if(orig_req_params.find("conversation_model_id") == orig_req_params.end()) {
             res->set_400("`conversation_model_id` is needed if conversation is enabled.");
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
 
@@ -733,6 +994,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
         if(!conversation_model_op.ok()) {
             res->set_400("`conversation_model_id` is invalid.");
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
         auto conversation_model = conversation_model_op.get();
@@ -743,6 +1006,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
             if(!conversation_history.ok()) {
                 res->set_400("`conversation_id` is invalid.");
+                res->final = true;
+                stream_response(req, res);
                 return false;
             }
         }
@@ -757,6 +1022,8 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
             if(!generate_standalone_q.ok()) {
                 res->set_400(generate_standalone_q.error());
+                res->final = true;
+                stream_response(req, res);
                 return false;
             }
 
@@ -764,7 +1031,7 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         }
     }
 
-    if (searches.size() > 1 && is_union) {
+    if (is_union) {
         Option<bool> union_op = CollectionManager::do_union(req->params, req->embedded_params_vec, searches,
                                                             response, req->conn_ts);
         if(!union_op.ok() && union_op.code() == 408) {
@@ -781,29 +1048,49 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
             auto validate_op = multi_search_validate_and_add_params(req->params, search_params, conversation);
             if (!validate_op.ok()) {
+                LOG(ERROR) << "multi_search parameter validation failed: " << validate_op.error()
+                          << " with code: " << validate_op.code();
+                // Log the problematic search parameters
+                LOG(ERROR) << "Problematic search parameters: " << search_params.dump();
                 res->set_400(validate_op.error());
+                res->final = true;
+                stream_response(req, res);
                 return false;
             }
+
+            uint64_t prompt_cache_ttl = NaturalLanguageSearchModelManager::DEFAULT_SCHEMA_PROMPT_TTL_SEC;
+            if(req->params.count("nl_query_prompt_cache_ttl") && StringUtils::is_uint64_t(req->params["nl_query_prompt_cache_ttl"])) {
+                prompt_cache_ttl = std::stoull(req->params["nl_query_prompt_cache_ttl"]);
+            }
+
+            auto nl_search_op = NaturalLanguageSearchModelManager::process_nl_query_and_augment_params(req->params, prompt_cache_ttl);
 
             std::string results_json_str;
             Option<bool> search_op = CollectionManager::do_search(req->params, req->embedded_params_vec[i],
                                                                   results_json_str, req->conn_ts);
 
+            auto nl_processing_time_ms = nl_search_op.ok() ? nl_search_op.get() : 0;
             if(search_op.ok()) {
                 auto results_json = nlohmann::json::parse(results_json_str);
                 if(conversation) {
                     results_json["request_params"]["q"] = common_query;
                 }
+
+                NaturalLanguageSearchModelManager::add_nl_query_data_to_results(results_json, &(req->params), nl_processing_time_ms);
+
                 response["results"].push_back(results_json);
             } else {
                 if(search_op.code() == 408) {
                     res->set(search_op.code(), search_op.error());
                     req->overloaded = true;
+                    res->final = true;
+                    stream_response(req, res);
                     return false;
                 }
                 nlohmann::json err_res;
                 err_res["error"] = search_op.error();
                 err_res["code"] = search_op.code();
+                NaturalLanguageSearchModelManager::add_nl_query_data_to_results(err_res, &(req->params), nl_processing_time_ms, true);
                 response["results"].push_back(err_res);
             }
         }
@@ -863,12 +1150,16 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         auto min_required_bytes_op = ConversationModel::get_minimum_required_bytes(conversation_model);
         if(!min_required_bytes_op.ok()) {
             res->set_400(min_required_bytes_op.error());
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
         auto min_required_bytes = min_required_bytes_op.get();
         auto prompt = req->params["q"];
         if(conversation_model["max_bytes"].get<size_t>() < min_required_bytes + prompt.size()) {
             res->set_400("`max_bytes` of the conversation model is less than the minimum required bytes(" + std::to_string(min_required_bytes) + ").");
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
 
@@ -893,20 +1184,37 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
             }
         }
 
-        auto answer_op = ConversationModel::get_answer(result_docs.dump(0), prompt, conversation_model);
+        Option<std::string> answer_op("");
+        std::string conversation_id = conversation_history ? orig_req_params["conversation_id"] : "";
+        bool conversation_id_created_in_advance = false;
+        if(!conversation_stream) {
+            answer_op = ConversationModel::get_answer(result_docs.dump(0), prompt, conversation_model);
+        } else {
+            // create conversation id in advance for streaming
+            if(conversation_id.empty()) {
+                conversation_id = sole::uuid4().str();
+                conversation_id_created_in_advance = true;
+            }
+            answer_op = ConversationModel::get_answer_stream(result_docs.dump(0), prompt, conversation_model, req, res, conversation_id);
+        }
 
         if(!answer_op.ok()) {
             res->set_400(answer_op.error());
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
 
         response["conversation"] = nlohmann::json::object();
         response["conversation"]["query"] = common_query;
         response["conversation"]["answer"] = answer_op.get();
-        std::string conversation_id = conversation_history ? orig_req_params["conversation_id"] : "";
-        auto conversation_history_op = ConversationManager::get_instance().get_full_conversation(common_query, answer_op.get(), conversation_model, conversation_id);
+
+        // do not send conversation id as param if streaming, because it is just created in advance for streaming
+        auto conversation_history_op = ConversationManager::get_instance().get_full_conversation(common_query, answer_op.get(), conversation_model, conversation_id_created_in_advance ? "" : conversation_id);
         if(!conversation_history_op.ok()) {
             res->set_400(conversation_history_op.error());
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
 
@@ -919,13 +1227,17 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         auto new_conversation_op = ConversationManager::get_last_n_messages(conversation_history["conversation"], 2);
         if(!new_conversation_op.ok()) {
             res->set_400(new_conversation_op.error());
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
         auto new_conversation = new_conversation_op.get();
 
-        auto add_conversation_op = ConversationManager::get_instance().add_conversation(new_conversation, conversation_model, conversation_id);
+        auto add_conversation_op = ConversationManager::get_instance().add_conversation(new_conversation, conversation_model, conversation_id, !conversation_id_created_in_advance);
         if(!add_conversation_op.ok()) {
             res->set_400(add_conversation_op.error());
+            res->final = true;
+            stream_response(req, res);
             return false;
         }
 
@@ -936,10 +1248,18 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
 
     }
 
-    res->set_200(response.dump());
+    std::string response_str = response.dump();
+    // if the response is an event stream, we need to add the data: prefix
+    if(res->content_type_header.find("event-stream") != std::string::npos) {
+        response_str = "data: " + response_str + "\n\n";
+    }
+
+    res->set_200(response_str);
+    res->final = true;
+    stream_response(req, res);
 
     // we will cache only successful requests
-    if(use_cache) {
+    if(use_cache && !conversation_stream) {
         //LOG(INFO) << "Adding to cache, key = " << req_hash;
         auto now = std::chrono::high_resolution_clock::now();
         const auto cache_ttl_it = req->params.find("cache_ttl");
@@ -949,10 +1269,11 @@ bool post_multi_search(const std::shared_ptr<http_req>& req, const std::shared_p
         }
 
         cached_res_t cached_res;
-        cached_res.load(res->status_code, res->content_type_header, res->body, now, cache_ttl, req_hash);
+        cached_res.load(res->status_code, res->content_type_header, response_str, now, cache_ttl, req_hash);
 
         std::unique_lock lock(mutex);
         res_cache.insert(req_hash, cached_res);
+        AppMetrics::get_instance().increment_count(AppMetrics::CACHE_MISS_LABEL, 1);
     }
 
     return true;
@@ -963,7 +1284,7 @@ bool get_collection_summary(const std::shared_ptr<http_req>& req, const std::sha
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -971,6 +1292,46 @@ bool get_collection_summary(const std::shared_ptr<http_req>& req, const std::sha
     res->set_200(json_response.dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
 
     return true;
+}
+
+Option<bool> populate_include_exclude(const std::shared_ptr<http_req>& req, std::shared_ptr<Collection>& collection,
+                                      const std::string& filter_query,
+                                      tsl::htrie_set<char>& include_fields, tsl::htrie_set<char>& exclude_fields,
+                                      std::vector<ref_include_exclude_fields>& ref_include_exclude_fields_vec) {
+    const char* INCLUDE_FIELDS = "include_fields";
+    const char* EXCLUDE_FIELDS = "exclude_fields";
+
+    std::vector<std::string> include_fields_vec;
+    std::vector<std::string> exclude_fields_vec;
+
+    if(req->params.count(INCLUDE_FIELDS) != 0) {
+        auto op = StringUtils::split_include_exclude_fields(req->params[INCLUDE_FIELDS], include_fields_vec);
+        if (!op.ok()) {
+            return op;
+        }
+    }
+
+    if(req->params.count(EXCLUDE_FIELDS) != 0) {
+        auto op = StringUtils::split_include_exclude_fields(req->params[EXCLUDE_FIELDS], exclude_fields_vec);
+        if (!op.ok()) {
+            return op;
+        }
+    }
+
+    auto initialize_op = Join::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec, exclude_fields_vec,
+                                                                         ref_include_exclude_fields_vec);
+    if (!initialize_op.ok()) {
+        return initialize_op;
+    }
+
+    spp::sparse_hash_set<std::string> includes;
+    spp::sparse_hash_set<std::string> excludes;
+    includes.insert(include_fields_vec.begin(), include_fields_vec.end());
+    excludes.insert(exclude_fields_vec.begin(), exclude_fields_vec.end());
+
+    collection->populate_include_exclude_fields_lk(includes, excludes, include_fields, exclude_fields);
+
+    return Option<bool>(true);
 }
 
 bool get_export_documents(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
@@ -981,14 +1342,12 @@ bool get_export_documents(const std::shared_ptr<http_req>& req, const std::share
     if(collection == nullptr) {
         req->last_chunk_aggregate = true;
         res->final = true;
-        res->set_404();
+        res->set_404("Collection not found");
         stream_response(req, res);
         return false;
     }
 
     const char* FILTER_BY = "filter_by";
-    const char* INCLUDE_FIELDS = "include_fields";
-    const char* EXCLUDE_FIELDS = "exclude_fields";
     const char* BATCH_SIZE = "batch_size";
     const char* VALIDATE_FIELD_NAMES = "validate_field_names";
 
@@ -1004,39 +1363,13 @@ bool get_export_documents(const std::shared_ptr<http_req>& req, const std::share
         req->data = export_state;
 
         std::string filter_query;
-        std::vector<std::string> include_fields_vec;
-        std::vector<std::string> exclude_fields_vec;
-        spp::sparse_hash_set<std::string> exclude_fields;
-        spp::sparse_hash_set<std::string> include_fields;
 
         if(req->params.count(FILTER_BY) != 0) {
             filter_query = req->params[FILTER_BY];
         }
 
-        if(req->params.count(INCLUDE_FIELDS) != 0) {
-            auto op = StringUtils::split_include_exclude_fields(req->params[INCLUDE_FIELDS], include_fields_vec);
-            if (!op.ok()) {
-                res->set(op.code(), op.error());
-                req->last_chunk_aggregate = true;
-                res->final = true;
-                stream_response(req, res);
-                return false;
-            }
-        }
-
-        if(req->params.count(EXCLUDE_FIELDS) != 0) {
-            auto op = StringUtils::split_include_exclude_fields(req->params[EXCLUDE_FIELDS], exclude_fields_vec);
-            if (!op.ok()) {
-                res->set(op.code(), op.error());
-                req->last_chunk_aggregate = true;
-                res->final = true;
-                stream_response(req, res);
-                return false;
-            }
-        }
-
-        auto initialize_op = Join::initialize_ref_include_exclude_fields_vec(filter_query, include_fields_vec, exclude_fields_vec,
-                                                                             export_state->ref_include_exclude_fields_vec);
+        auto initialize_op = populate_include_exclude(req, collection, filter_query, export_state->include_fields,
+                                                      export_state->exclude_fields, export_state->ref_include_exclude_fields_vec);
         if (!initialize_op.ok()) {
             res->set(initialize_op.code(), initialize_op.error());
             req->last_chunk_aggregate = true;
@@ -1044,12 +1377,6 @@ bool get_export_documents(const std::shared_ptr<http_req>& req, const std::share
             stream_response(req, res);
             return false;
         }
-
-        include_fields.insert(include_fields_vec.begin(), include_fields_vec.end());
-        exclude_fields.insert(exclude_fields_vec.begin(), exclude_fields_vec.end());
-
-        collection->populate_include_exclude_fields_lk(include_fields, exclude_fields,
-                                                      export_state->include_fields, export_state->exclude_fields);
 
         if(req->params.count(BATCH_SIZE) != 0 && StringUtils::is_uint32_t(req->params[BATCH_SIZE])) {
             export_state->export_batch_size = std::stoul(req->params[BATCH_SIZE]);
@@ -1104,7 +1431,7 @@ bool get_export_documents(const std::shared_ptr<http_req>& req, const std::share
                 }
 
                 auto const& coll = export_state->collection;
-                auto const seq_id_op = coll->doc_id_to_seq_id_with_lock(doc.at("id"));
+                auto const seq_id_op = coll->doc_id_to_seq_id(doc.at("id"));
                 if (!seq_id_op.ok()) {
                     res->set(seq_id_op.code(), seq_id_op.error());
                     req->last_chunk_aggregate = true;
@@ -1276,7 +1603,7 @@ bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shar
     if(collection == nullptr) {
         //LOG(INFO) << "collection == nullptr, for collection: " << req->params["collection"];
         res->final = true;
-        res->set_404();
+        res->set_404("Collection not found");
         stream_response(req, res);
         return false;
     }
@@ -1385,7 +1712,7 @@ bool post_add_document(const std::shared_ptr<http_req>& req, const std::shared_p
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1451,7 +1778,7 @@ bool patch_update_document(const std::shared_ptr<http_req>& req, const std::shar
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1486,7 +1813,7 @@ bool patch_update_documents(const std::shared_ptr<http_req>& req, const std::sha
     CollectionManager & collectionManager = CollectionManager::get_instance();
     auto collection = collectionManager.get_collection(req->params["collection"]);
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1516,16 +1843,10 @@ bool patch_update_documents(const std::shared_ptr<http_req>& req, const std::sha
 bool get_fetch_document(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
     std::string doc_id = req->params["id"];
 
-    const char* INCLUDE_FIELDS = "include_fields";
-    const char* EXCLUDE_FIELDS = "exclude_fields";
-
-    spp::sparse_hash_set<std::string> exclude_fields;
-    spp::sparse_hash_set<std::string> include_fields;
-
     CollectionManager & collectionManager = CollectionManager::get_instance();
     auto collection = collectionManager.get_collection(req->params["collection"]);
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1536,32 +1857,29 @@ bool get_fetch_document(const std::shared_ptr<http_req>& req, const std::shared_
         return false;
     }
 
-    if(req->params.count(INCLUDE_FIELDS) != 0) {
-        std::vector<std::string> include_fields_vec;
-        StringUtils::split(req->params[INCLUDE_FIELDS], include_fields_vec, ",");
-        include_fields = spp::sparse_hash_set<std::string>(include_fields_vec.begin(), include_fields_vec.end());
-    }
-
-    if(req->params.count(EXCLUDE_FIELDS) != 0) {
-        std::vector<std::string> exclude_fields_vec;
-        StringUtils::split(req->params[EXCLUDE_FIELDS], exclude_fields_vec, ",");
-        exclude_fields = spp::sparse_hash_set<std::string>(exclude_fields_vec.begin(), exclude_fields_vec.end());
+    tsl::htrie_set<char> include_fields;
+    tsl::htrie_set<char> exclude_fields;
+    std::vector<ref_include_exclude_fields> ref_include_exclude_fields_vec;
+    auto initialize_op = populate_include_exclude(req, collection, "", include_fields, exclude_fields,
+                                                  ref_include_exclude_fields_vec);
+    if (!initialize_op.ok()) {
+        res->set(initialize_op.code(), initialize_op.error());
+        req->last_chunk_aggregate = true;
+        res->final = true;
+        stream_response(req, res);
+        return false;
     }
 
     nlohmann::json doc = doc_option.get();
+    auto const seq_id_op = collection->doc_id_to_seq_id(doc.at("id"));
 
-    for(auto it = doc.begin(); it != doc.end(); ++it) {
-        if(!include_fields.empty() && include_fields.count(it.key()) == 0) {
-            doc.erase(it.key());
-            continue;
-        }
-
-        if(!exclude_fields.empty() && exclude_fields.count(it.key()) != 0) {
-            doc.erase(it.key());
-            continue;
-        }
+    std::map<std::string, reference_filter_result_t> references = {};
+    const auto prune_op = collection->prune_doc_with_lock(doc, include_fields, exclude_fields, references, seq_id_op.get(),
+                                                          ref_include_exclude_fields_vec);
+    if (!prune_op.ok()) {
+        res->set(prune_op.code(), prune_op.error());
+        return false;
     }
-
 
     res->set_200(doc.dump(-1, ' ', false, nlohmann::detail::error_handler_t::ignore));
     return true;
@@ -1578,7 +1896,7 @@ bool del_remove_document(const std::shared_ptr<http_req>& req, const std::shared
     CollectionManager & collectionManager = CollectionManager::get_instance();
     auto collection = collectionManager.get_collection(req->params["collection"]);
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1628,7 +1946,7 @@ bool del_remove_documents(const std::shared_ptr<http_req>& req, const std::share
     if(collection == nullptr) {
         req->last_chunk_aggregate = true;
         res->final = true;
-        res->set_404();
+        res->set_404("Collection not found");
         stream_response(req, res);
         return false;
     }
@@ -1638,6 +1956,8 @@ bool del_remove_documents(const std::shared_ptr<http_req>& req, const std::share
     const char *TOP_K_BY = "top_k_by";
     const char* VALIDATE_FIELD_NAMES = "validate_field_names";
     const char* TRUNCATE = "truncate";
+    const char* RETURN_DOC = "return_doc";
+    const char* RETURN_ID = "return_id";
 
     if(req->params.count(TOP_K_BY) != 0) {
         std::vector<std::string> parts;
@@ -1729,6 +2049,14 @@ bool del_remove_documents(const std::shared_ptr<http_req>& req, const std::share
         // destruction of data is managed by req destructor
         req->data = deletion_state;
 
+        if (req->params.count(RETURN_DOC) != 0 && req->params[RETURN_DOC] == "true") {
+            deletion_state->return_doc = true;
+        }
+
+        if (req->params.count(RETURN_ID) != 0 && req->params[RETURN_ID] == "true") {
+            deletion_state->return_id = true;
+        }
+
         bool validate_field_names = true;
         if (req->params.count(VALIDATE_FIELD_NAMES) != 0 && req->params[VALIDATE_FIELD_NAMES] == "false") {
             validate_field_names = false;
@@ -1771,6 +2099,15 @@ bool del_remove_documents(const std::shared_ptr<http_req>& req, const std::share
             res->final = false;
         } else {
             response["num_deleted"] = deletion_state->num_removed;
+
+            if (deletion_state->return_doc && !deletion_state->removed_docs.empty()) {
+                response["documents"] = deletion_state->removed_docs;
+            }
+
+            if (deletion_state->return_id && !deletion_state->removed_ids.empty()) {
+                response["ids"] = deletion_state->removed_ids;
+            }
+
             req->last_chunk_aggregate = true;
             res->body = response.dump();
             res->final = true;
@@ -1809,7 +2146,7 @@ bool get_alias(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_
     Option<std::string> collection_name_op = collectionManager.resolve_symlink(alias);
 
     if(!collection_name_op.ok()) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1859,7 +2196,7 @@ bool del_alias(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_
 
     Option<std::string> collection_name_op = collectionManager.resolve_symlink(alias);
     if(!collection_name_op.ok()) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1882,7 +2219,7 @@ bool get_overrides(const std::shared_ptr<http_req>& req, const std::shared_ptr<h
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1929,7 +2266,7 @@ bool get_override(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1953,7 +2290,7 @@ bool put_override(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     std::string override_id = req->params["id"];
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -1994,7 +2331,7 @@ bool del_override(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -2246,7 +2583,7 @@ bool get_synonyms(const std::shared_ptr<http_req>& req, const std::shared_ptr<ht
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -2292,7 +2629,7 @@ bool get_synonym(const std::shared_ptr<http_req>& req, const std::shared_ptr<htt
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -2318,7 +2655,7 @@ bool put_synonym(const std::shared_ptr<http_req>& req, const std::shared_ptr<htt
     std::string synonym_id = req->params["id"];
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -2375,7 +2712,7 @@ bool del_synonym(const std::shared_ptr<http_req>& req, const std::shared_ptr<htt
     auto collection = collectionManager.get_collection(req->params["collection"]);
 
     if(collection == nullptr) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -3004,7 +3341,7 @@ bool get_stemming_dictionary(const std::shared_ptr<http_req>& req, const std::sh
     nlohmann::json dictionary;
 
     if(!StemmerManager::get_instance().get_stemming_dictionary(id, dictionary)) {
-        res->set_404();
+        res->set_404("Collection not found");
         return false;
     }
 
@@ -3348,5 +3685,185 @@ bool put_personalization_model(const std::shared_ptr<http_req>& req, const std::
         response.erase("model_path");
     }
     res->set_200(response.dump());
+    return true;
+}
+
+bool post_proxy_sse(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    HttpProxy& proxy = HttpProxy::get_instance();
+
+    nlohmann::json req_json;
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        res->final = true;
+        stream_response(req, res);
+        return false;
+    }
+
+    std::string body, url, method;
+    std::unordered_map<std::string, std::string> headers;
+
+    if(req_json.count("url") == 0 || req_json.count("method") == 0) {
+        res->set_400("Missing required fields.");
+        res->final = true;
+        stream_response(req, res);
+        return false;
+    }
+
+    if(!req_json["url"].is_string() || !req_json["method"].is_string() || req_json["url"].get<std::string>().empty() || req_json["method"].get<std::string>().empty()) {
+        res->set_400("URL and method must be non-empty strings.");
+        res->final = true;
+        stream_response(req, res);
+        return false;
+    }
+
+    try {
+        if(req_json.count("body") != 0 && !req_json["body"].is_string()) {
+            res->set_400("Body must be a string.");
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        if(req_json.count("headers") != 0 && !req_json["headers"].is_object()) {
+            res->set_400("Headers must be a JSON object.");
+            res->final = true;
+            stream_response(req, res);
+            return false;
+        }
+        if(req_json.count("body")) {
+            body = req_json["body"].get<std::string>();
+        }
+        url = req_json["url"].get<std::string>();
+        method = req_json["method"].get<std::string>();
+        if(req_json.count("headers")) {
+            headers = req_json["headers"].get<std::unordered_map<std::string, std::string>>();
+        }
+    } catch(const std::exception& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        res->final = true;
+        stream_response(req, res);
+        return false;
+    }
+
+    return proxy.call_sse(url, method, body, headers, req, res);
+}
+
+bool get_nl_search_models(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    auto models_op = NaturalLanguageSearchModelManager::get_all_models();
+
+    if(!models_op.ok()) {
+        res->set(models_op.code(), models_op.error());
+        return false;
+    }
+
+    auto models = models_op.get();
+
+     for(auto& model: models) {
+         Collection::hide_credential(model, "api_key");
+     }
+
+    res->set_200(models.dump());
+    return true;
+}
+
+bool get_nl_search_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    const std::string& model_id = req->params["id"];
+
+    auto model_op = NaturalLanguageSearchModelManager::get_model(model_id);
+
+    if(!model_op.ok()) {
+        res->set(model_op.code(), model_op.error());
+        return false;
+    }
+
+    auto model = model_op.get();
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
+    return true;
+}
+
+bool post_nl_search_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    nlohmann::json model_json;
+
+    try {
+        model_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    if(!model_json.is_object()) {
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    std::string model_id = req->metadata;
+
+    auto add_model_op = NaturalLanguageSearchModelManager::add_model(model_json, model_id, true);
+
+    if(!add_model_op.ok()) {
+        res->set(add_model_op.code(), add_model_op.error());
+        return false;
+    }
+
+    Collection::hide_credential(model_json, "api_key");
+
+    res->set_200(model_json.dump());
+    return true;
+}
+
+bool put_nl_search_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    const std::string& model_id = req->params["id"];
+
+    nlohmann::json req_json;
+
+    try {
+        req_json = nlohmann::json::parse(req->body);
+    } catch(const nlohmann::json::parse_error& e) {
+        LOG(ERROR) << "JSON error: " << e.what();
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    if(!req_json.is_object()) {
+        res->set_400("Bad JSON.");
+        return false;
+    }
+
+    auto model_op = NaturalLanguageSearchModelManager::update_model(model_id, req_json);
+
+    if(!model_op.ok()) {
+        res->set(model_op.code(), model_op.error());
+        return false;
+    }
+
+    auto model = model_op.get();
+
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
+    return true;
+}
+
+bool delete_nl_search_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res) {
+    const std::string& model_id = req->params["id"];
+
+    auto model_op = NaturalLanguageSearchModelManager::delete_model(model_id);
+
+    if(!model_op.ok()) {
+        res->set(model_op.code(), model_op.error());
+        return false;
+    }
+
+    auto model = model_op.get();
+
+    Collection::hide_credential(model, "api_key");
+
+    res->set_200(model.dump());
     return true;
 }

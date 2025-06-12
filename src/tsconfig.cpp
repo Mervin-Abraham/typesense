@@ -76,6 +76,20 @@ Option<bool> Config::update_config(const nlohmann::json& req_json) {
         found_config = true;
     }
 
+    if(req_json.count("embedding-cache-num-entries") != 0) {
+        if(!req_json["embedding-cache-num-entries"].is_number_integer()) {
+            return Option<bool>(400, "Configuration `embedding-cache-num-entries` must be an integer.");
+        }
+
+        int embedding_cache_entries_num = req_json["embedding-cache-num-entries"].get<int>();
+        if(embedding_cache_entries_num <= 0) {
+            return Option<bool>(400, "Configuration `embedding-cache-num-entries` must be a positive integer.");
+        }
+
+        set_embedding_cache_num_entries(embedding_cache_entries_num);
+        found_config = true;
+    }
+
     if(req_json.count("skip-writes") != 0) {
         if(!req_json["skip-writes"].is_boolean()) {
             return Option<bool>(400, ("Configuration `skip-writes` must be a boolean."));
@@ -212,6 +226,10 @@ void Config::load_config_env() {
         this->cache_num_entries = std::stoi(get_env("TYPESENSE_CACHE_NUM_ENTRIES"));
     }
 
+    if(!get_env("TYPESENSE_EMBEDDING_CACHE_NUM_ENTRIES").empty()) {
+        this->embedding_cache_num_entries = std::stoi(get_env("TYPESENSE_EMBEDDING_CACHE_NUM_ENTRIES"));
+    }
+
     if(!get_env("TYPESENSE_ANALYTICS_FLUSH_INTERVAL").empty()) {
         this->analytics_flush_interval = std::stoi(get_env("TYPESENSE_ANALYTICS_FLUSH_INTERVAL"));
     }
@@ -260,6 +278,10 @@ void Config::load_config_env() {
         this->max_per_page = std::stoi(get_env("TYPESENSE_MAX_PER_PAGE"));
     }
 
+    if(!get_env("TYPESENSE_MAX_GROUP_LIMIT").empty()) {
+        this->max_group_limit = std::stoi(get_env("TYPESENSE_MAX_GROUP_LIMIT"));
+    }
+
     if(!get_env("TYPESENSE_ANALYTICS_DIR").empty()) {
         this->analytics_dir = get_env("TYPESENSE_ANALYTICS_DIR");
     }
@@ -270,6 +292,26 @@ void Config::load_config_env() {
 
     if(!get_env("TYPESENSE_ANALYTICS_MINUTE_RATE_LIMIT").empty()) {
         this->analytics_minute_rate_limit = std::stoi(get_env("TYPESENSE_ANALYTICS_MINUTE_RATE_LIMIT"));
+    }
+
+    if(!get_env("TYPESENSE_DB_WRITE_BUFFER_SIZE").empty()) {
+        this->db_write_buffer_size = std::stoi(get_env("TYPESENSE_DB_WRITE_BUFFER_SIZE"));
+    }
+
+    if(!get_env("TYPESENSE_DB_MAX_WRITE_BUFFER_NUMBER").empty()) {
+        this->db_max_write_buffer_number = std::stoi(get_env("TYPESENSE_DB_MAX_WRITE_BUFFER_NUMBER"));
+    }
+
+    if(!get_env("TYPESENSE_DB_MAX_LOG_FILE_SIZE").empty()) {
+        this->db_max_log_file_size = std::stoi(get_env("TYPESENSE_DB_MAX_LOG_FILE_SIZE"));
+    }
+
+    if(!get_env("TYPESENSE_DB_KEEP_LOG_FILE_NUM").empty()) {
+        this->db_keep_log_file_num = std::stoi(get_env("TYPESENSE_DB_KEEP_LOG_FILE_NUM"));
+    }
+
+    if(!get_env("TYPESENSE_MAX_INDEXING_CONCURRENCY").empty()) {
+        this->max_indexing_concurrency = std::stoi(get_env("TYPESENSE_MAX_INDEXING_CONCURRENCY"));
     }
 }
 
@@ -421,6 +463,10 @@ void Config::load_config_file(cmdline::parser& options) {
         this->cache_num_entries = (int) reader.GetInteger("server", "cache-num-entries", 1000);
     }
 
+    if(reader.Exists("server", "embedding-cache-num-entries")) {
+        this->embedding_cache_num_entries = (int) reader.GetInteger("server", "embedding-cache-num-entries", 100);
+    }
+
     if(reader.Exists("server", "analytics-flush-interval")) {
         this->analytics_flush_interval = (int) reader.GetInteger("server", "analytics-flush-interval", 3600);
     }
@@ -483,8 +529,32 @@ void Config::load_config_file(cmdline::parser& options) {
         this->max_per_page = reader.GetInteger("server", "max-per-page", 250);
     }
 
+    if(reader.Exists("server", "max-group-limit")) {
+        this->max_group_limit = reader.GetInteger("server", "max-group-limit", 99);
+    }
+
     if(reader.Exists("server", "filter-by-max-ops")) {
         this->filter_by_max_ops = (uint16_t) reader.GetInteger("server", "filter-by-max-ops", FILTER_BY_DEFAULT_OPERATIONS);
+    }
+
+    if(reader.Exists("server", "db-write-buffer-size")) {
+        this->db_write_buffer_size = (size_t) reader.GetInteger("server", "db-write-buffer-size", 4*1048576);
+    }
+
+    if(reader.Exists("server", "db-max-write-buffer-number")) {
+        this->db_write_buffer_size = (size_t) reader.GetInteger("server", "db-max-write-buffer-number", 2);
+    }
+
+    if(reader.Exists("server", "db-max-log-file-size")) {
+        this->db_write_buffer_size = (size_t) reader.GetInteger("server", "db-max-log-file-size", 4*1048576);
+    }
+
+    if(reader.Exists("server", "db-keep-log-file-num")) {
+        this->db_write_buffer_size = (size_t) reader.GetInteger("server", "db-keep-log-file-num", 5);
+    }
+
+    if(reader.Exists("server", "max-indexing-concurrency")) {
+        this->max_indexing_concurrency = reader.GetInteger("server", "max-indexing-concurrency", 4);
     }
 }
 
@@ -615,6 +685,10 @@ void Config::load_config_cmd_args(cmdline::parser& options)  {
         this->cache_num_entries = options.get<uint32_t>("cache-num-entries");
     }
 
+    if(options.exist("embedding-cache-num-entries")) {
+        this->embedding_cache_num_entries = options.get<uint32_t>("embedding-cache-num-entries");
+    }
+
     if(options.exist("analytics-flush-interval")) {
         this->analytics_flush_interval = options.get<uint32_t>("analytics-flush-interval");
     }
@@ -671,9 +745,32 @@ void Config::load_config_cmd_args(cmdline::parser& options)  {
         this->max_per_page = options.get<int>("max-per-page");
     }
 
+    if(options.exist("max-group-limit")) {
+        this->max_group_limit = options.get<uint32_t>("max-group-limit");
+    }
+
     if(options.exist("filter-by-max-ops")) {
         this->filter_by_max_ops = options.get<uint16_t>("filter-by-max-ops");
+    }
 
+    if(options.exist("db-write-buffer-size")) {
+        this->db_write_buffer_size = options.get<uint32_t>("db-write-buffer-size");
+    }
+
+    if(options.exist("db-max-write-buffer-number")) {
+        this->db_write_buffer_size = options.get<uint32_t>("db-max-write-buffer-number");
+    }
+
+    if(options.exist("db-max-log-file-size")) {
+        this->db_write_buffer_size = options.get<uint32_t>("db-max-log-file-size");
+    }
+
+    if(options.exist("db-keep-log-file-num")) {
+        this->db_write_buffer_size = options.get<uint32_t>("db-keep-log-file-num");
+    }
+
+    if(options.exist("max-indexing-concurrency")) {
+        this->max_indexing_concurrency = options.get<uint32_t>("max-indexing-concurrency");
     }
 }
 

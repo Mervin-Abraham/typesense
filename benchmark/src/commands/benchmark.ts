@@ -23,8 +23,8 @@ import { DEFAULT_TYPESENSE_GIT_URL } from "@/services/git";
 import { K6Benchmarks } from "@/services/k6";
 import { ReproductionService } from "@/services/reproduction";
 import { TypesenseProcessManager } from "@/services/typesense-process";
+import { delay } from "@/utils/base";
 import { toErrorWithMessage } from "@/utils/error";
-import { delay } from "@/utils/execa";
 import { logger, LogLevel } from "@/utils/logger";
 import { dirName, findRoot } from "@/utils/package-info";
 import { loadConfig, parseOptions } from "@/utils/parse";
@@ -76,8 +76,14 @@ export const BenchmarkConfigSchema = z
       .record(
         KeySchema,
         z.object({
-          "50vu": z.number().min(0).max(100),
-          "100vu": z.number().min(0).max(100),
+          "50vu": z.object({
+            percentage: z.number().min(0).max(100),
+            milliseconds: z.number().min(0),
+          }),
+          "100vu": z.object({
+            percentage: z.number().min(0).max(100),
+            milliseconds: z.number().min(0),
+          }),
         }),
       )
       .refine((obj): obj is Required<typeof obj> => KeySchema.options.every((key) => obj[key] != null)),
@@ -89,40 +95,94 @@ type BenchmarkConfig = z.infer<typeof BenchmarkConfigSchema>;
 export const defaultConfig: BenchmarkConfig = {
   failureThresholds: {
     filter_complex: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 1500,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 1500,
+        percentage: 50,
+      },
     },
     filter_simple: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 200,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 200,
+        percentage: 50,
+      },
     },
     group: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 6000,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 6000,
+        percentage: 50,
+      },
     },
     just_q: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 7,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 7,
+        percentage: 50,
+      },
     },
     q_star: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 5,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 5,
+        percentage: 50,
+      },
     },
     sort_eval_condition: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 750,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 750,
+        percentage: 50,
+      },
     },
     sort_eval_score: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 800,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 800,
+        percentage: 50,
+      },
     },
     sort_simple: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 600,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 600,
+        percentage: 50,
+      },
     },
     facet: {
-      "100vu": 50,
-      "50vu": 50,
+      "100vu": {
+        milliseconds: 1500,
+        percentage: 50,
+      },
+      "50vu": {
+        milliseconds: 1500,
+        percentage: 50,
+      },
     },
   },
 };
@@ -194,7 +254,7 @@ class Benchmarks {
   private readonly isInCi: boolean;
   private readonly commitHashes: [string, string];
   private readonly percentagesForFailure: BenchmarkConfig["failureThresholds"];
-  private readonly port: number;
+  private readonly port: (typeof TypesenseProcessManager.nodeToPortMap)[number]["http"];
   private readonly spinner: Ora;
   private readonly benchmarkGroupsByCommitHash: Record<string, BenchmarkGroup>;
   private readonly reproductionService: ReproductionService;
@@ -204,7 +264,7 @@ class Benchmarks {
     batchSize: number;
     duration: string;
     apiKey: string;
-    port: number;
+    port: (typeof TypesenseProcessManager.nodeToPortMap)[number]["http"];
     services: ServiceContainer;
     spinner: Ora;
     workingDirectory: string;
@@ -282,7 +342,7 @@ class Benchmarks {
     const { searchResults } = results;
     const failingBenchmarks = searchResults.filter((row) => {
       const threshold = this.percentagesForFailure[row.scenario][`${row.vus}vu`];
-      return row.percentageChange > threshold;
+      return row.percentageChange > threshold.percentage && row.newValue > row.oldValue + threshold.milliseconds;
     });
     const passingBenchmarks = searchResults.filter((row) => !failingBenchmarks.includes(row));
 
@@ -298,7 +358,7 @@ class Benchmarks {
         const failures = failingBenchmarks
           .map((row) => {
             const threshold = this.percentagesForFailure[row.scenario][`${row.vus}vu`];
-            return `${row.metric} for ${row.displayVariable || `${row.scenario} (${row.vus}vu)`} changed by ${row.formattedPercentageChange} (threshold: ${threshold}%)`;
+            return `${row.metric} for ${row.displayVariable || `${row.scenario} (${row.vus}vu)`} changed by ${row.formattedPercentageChange} (threshold: ${threshold.percentage}%) or exceeded the time threshold of ${threshold.milliseconds}ms`;
           })
           .join("\n");
 
@@ -797,7 +857,7 @@ class Benchmarks {
     return okAsync({ searchResults: formatedSearchResults, indexingResults: formattedIndexResult });
   }
 
-  benchmark() {
+  perform() {
     logger.info("Running benchmarks");
 
     return this.startContainers()
@@ -929,20 +989,8 @@ const benchmark = new Command()
         logger.debug("Starting Typesense process");
 
         const typesenseProcessManagers = [
-          new TypesenseProcessManager(
-            spinner,
-            options.binaries[0],
-            options.apiKey,
-            options.workingDirectory,
-            services.get("fs"),
-          ),
-          new TypesenseProcessManager(
-            spinner,
-            options.binaries[1],
-            options.apiKey,
-            options.workingDirectory,
-            services.get("fs"),
-          ),
+          new TypesenseProcessManager(spinner, options.binaries[0], options.apiKey, options.workingDirectory),
+          new TypesenseProcessManager(spinner, options.binaries[1], options.apiKey, options.workingDirectory),
         ] as [TypesenseProcessManager, TypesenseProcessManager];
 
         const benchmark = new Benchmarks({
@@ -960,7 +1008,7 @@ const benchmark = new Command()
 
         return ok(benchmark);
       })
-      .andThen((benchmark) => benchmark.benchmark())
+      .andThen((benchmark) => benchmark.perform())
       .then((result) => {
         if (result.isErr()) {
           spinner.fail();

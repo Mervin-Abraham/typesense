@@ -26,6 +26,8 @@
 #include "conversation_manager.h"
 #include "vq_model_manager.h"
 #include "stemmer_manager.h"
+#include "natural_language_search_model_manager.h"
+#include "conversation_model.h"
 
 #ifndef ASAN_BUILD
 #include "jemalloc.h"
@@ -112,7 +114,8 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<bool>("reset-peers-on-error", '\0', "Reset node's peers on clustering error. Default: false.", false, false);
 
     options.add<int>("log-slow-searches-time-ms", '\0', "When >= 0, searches that take longer than this duration are logged.", false, 30*1000);
-    options.add<int>("cache-num-entries", '\0', "Number of entries to cache.", false, 1000);
+    options.add<uint32_t>("cache-num-entries", '\0', "Number of entries to cache.", false, 1000);
+    options.add<uint32_t>("embedding-cache-num-entries", '\0', "Number of entries to cache for embeddings.", false, 100);
     options.add<uint32_t>("analytics-flush-interval", '\0', "Frequency of persisting analytics data to disk (in seconds).", false, 3600);
     options.add<uint32_t>("housekeeping-interval", '\0', "Frequency of housekeeping background job (in seconds).", false, 1800);
     options.add<bool>("enable-lazy-filter", '\0', "Filter clause will be evaluated lazily.", false, false);
@@ -120,6 +123,14 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<uint16_t>("filter-by-max-ops", '\0', "Maximum number of operations permitted in filtery_by.", false, Config::FILTER_BY_DEFAULT_OPERATIONS);
 
     options.add<int>("max-per-page", '\0', "Max number of hits per page", false, 250);
+    options.add<uint32_t>("max-group-limit", '\0', "Max number of results to be returned per group", false, 99);
+
+    //rocksdb options
+    options.add<uint32_t>("db-write-buffer-size", '\0', "rocksdb write buffer size.", false);
+    options.add<uint32_t>("db-max-write-buffer-number", '\0', "rocksdb max write buffer number.", false);
+    options.add<uint32_t>("db-max-log-file-size", '\0', "rocksdb max logfile size.", false);
+    options.add<uint32_t>("db-keep-log-file-num", '\0', "rocksdb number of log files to keep.", false);
+    options.add<uint32_t>("max-indexing-concurrency", '\0', "maximum concurrency for batch indexing docs.", false);
 
     // DEPRECATED
     options.add<std::string>("listen-address", 'h', "[DEPRECATED: use `api-address`] Address to which Typesense API service binds.", false, "0.0.0.0");
@@ -310,10 +321,13 @@ int start_raft_server(ReplicationState& replication_state, Store& store,
             } else {
                 const std::string& nodes_config = ReplicationState::to_nodes_config(peering_endpoint, api_port,
                                                                                     refreshed_nodes_op.get());
-                replication_state.refresh_nodes(nodes_config, raft_counter, reset_peers_on_error);
-
-                if(raft_counter % 60 == 0) {
-                    replication_state.do_snapshot(nodes_config);
+                if(nodes_config.empty()) {
+                    LOG(WARNING) << "No nodes resolved from peer configuration.";
+                } else {
+                    replication_state.refresh_nodes(nodes_config, raft_counter, reset_peers_on_error);
+                    if(raft_counter % 60 == 0) {
+                        replication_state.do_snapshot(nodes_config);
+                    }
                 }
             }
         }
@@ -401,6 +415,11 @@ int run_server(const Config & config, const std::string & version, void (*master
     int32_t analytics_db_ttl = config.get_analytics_db_ttl();
     uint32_t analytics_minute_rate_limit = config.get_analytics_minute_rate_limit();
 
+    size_t db_write_buffer_size = config.get_db_write_buffer_size();
+    size_t db_max_write_buffer_number = config.get_db_max_write_buffer_number();
+    size_t db_max_log_file_size = config.get_db_max_log_file_size();
+    size_t db_keep_log_file_num = config.get_db_keep_log_file_num();
+
     size_t thread_pool_size = config.get_thread_pool_size();
 
     const size_t proc_count = std::max<size_t>(1, std::thread::hardware_concurrency());
@@ -416,7 +435,8 @@ int run_server(const Config & config, const std::string & version, void (*master
     ThreadPool replication_thread_pool(num_threads);
 
     // primary DB used for storing the documents: we will not use WAL since Raft provides that
-    Store store(db_dir, 24*60*60, 1024, true);
+    Store store(db_dir, 24*60*60, 1024, true, 0, db_write_buffer_size, db_max_write_buffer_number,
+                db_max_log_file_size, db_keep_log_file_num);
 
     // meta DB for storing house keeping things
     Store meta_store(meta_dir, 24*60*60, 1024, false);
@@ -442,6 +462,8 @@ int run_server(const Config & config, const std::string & version, void (*master
     }
 
     AnalyticsManager::get_instance().init(&store, analytics_store, analytics_minute_rate_limit);
+
+    RemoteEmbedder::cache.capacity(config.get_embedding_cache_num_entries());
 
     curl_global_init(CURL_GLOBAL_SSL);
     HttpClient & httpClient = HttpClient::get_instance();
@@ -504,6 +526,14 @@ int run_server(const Config & config, const std::string & version, void (*master
 
     if(!conversations_init.ok()) {
         LOG(INFO) << "Failed to initialize conversation manager: " << conversations_init.error();
+    }
+
+    auto natural_language_search_init = NaturalLanguageSearchModelManager::init(&store);
+
+    if(!natural_language_search_init.ok()) {
+        LOG(INFO) << "Failed to initialize natural language search model manager: " << natural_language_search_init.error();
+    } else {
+        LOG(INFO) << "Loaded " << natural_language_search_init.get() << " natural language search model(s).";
     }
 
     std::thread raft_thread([&replication_state, &store, &config, &state_dir,
